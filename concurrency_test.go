@@ -345,6 +345,248 @@ func TestConcurrentCommitsBarrier(t *testing.T) {
 	}
 }
 
+// TestConcurrentTransferBarrier 屏障下多个 goroutine 持同一修订号并发
+// 转让：恰好一笔成功，其余全部冲突；失败转让绝不进入 Applied 轨迹，
+// 两组有效额度只被赢家改动一次。
+func TestConcurrentTransferBarrier(t *testing.T) {
+	s, err := tenantsched.New([]tenantsched.GroupSpec{
+		{ID: "R", Quota: 1000},
+		{ID: "a", Parent: "R", Quota: 10},
+		{ID: "b", Parent: "R", Quota: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const contenders = 24
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	done.Add(contenders)
+
+	var wins, conflicts int64
+	for i := 0; i < contenders; i++ {
+		go func() {
+			defer done.Done()
+			start.Wait()
+			// 所有调用持同一修订号 0、同额 1：最多一笔成功。
+			_, err := s.Transfer("a", "b", 1, 0)
+			switch {
+			case err == nil:
+				atomic.AddInt64(&wins, 1)
+			case errors.Is(err, tenantsched.ErrConflict):
+				atomic.AddInt64(&conflicts, 1)
+			default:
+				t.Errorf("unexpected transfer error: %v", err)
+			}
+		}()
+	}
+	start.Done()
+	done.Wait()
+
+	if wins != 1 || conflicts != contenders-1 {
+		t.Fatalf("wins=%d conflicts=%d, want 1/%d", wins, conflicts, contenders-1)
+	}
+	if s.Revision() != 1 {
+		t.Fatalf("revision=%d, want 1 (failed transfers leave no side effects)", s.Revision())
+	}
+
+	// 快照投影：a 有效 9、b 有效 2，尚未入账。
+	snap := s.Snapshot()
+	eff := map[string]int{}
+	for _, q := range snap.Quotas {
+		eff[q.GroupID] = q.Effective
+	}
+	if eff["a"] != 9 || eff["b"] != 2 || eff["R"] != 1000 {
+		t.Fatalf("projected effective after race = %v, want a=9 b=2 R=1000", eff)
+	}
+
+	// 推进一个 tick：Applied 中恰好一条 TRANSFER，金额 1。
+	res, err := s.Advance(1, s.Revision())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ap := res.Ticks[0].Applied
+	if len(ap) != 1 || ap[0].Kind != tenantsched.ChangeTransfer ||
+		ap[0].From != "a" || ap[0].Group != "b" || ap[0].Amount != 1 {
+		t.Fatalf("applied = %+v, want exactly one TRANSFER a->b x1", ap)
+	}
+
+	// 全量轨迹中该转让只出现一次。
+	n := 0
+	for _, e := range s.Trace() {
+		for _, a := range e.Applied {
+			if a.Kind == tenantsched.ChangeTransfer {
+				n++
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("transfer recorded %d times in trace, want 1", n)
+	}
+}
+
+// TestTransferVsAdvanceRevisionRace 转让与推进持同一旧修订号竞争：
+// 两类写操作之间最多成功一笔；若赢家是推进，则转让必须冲突且其调整绝不
+// 出现在该 tick（阻挡按没有转让的有效额度重放）。
+func TestTransferVsAdvanceRevisionRace(t *testing.T) {
+	for round := 0; round < 50; round++ {
+		s, err := tenantsched.New([]tenantsched.GroupSpec{
+			{ID: "R", Quota: 100},
+			{ID: "a", Parent: "R", Quota: 10},
+			{ID: "b", Parent: "R", Quota: 1},
+			{ID: "c", Parent: "b", Quota: 10},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Submit(tenantsched.JobSpec{
+			ID: "jb", ReleaseAt: 0, Work: 5, Deadline: 100, Group: "c",
+		}, 0); err != nil {
+			t.Fatal(err)
+		}
+		// 先让 b 用掉基础额度 1（tick0 执行，tick1 起被 b 挡住）。
+		if _, err := s.Advance(1, s.Revision()); err != nil {
+			t.Fatal(err)
+		}
+		baseRev := s.Revision() // = 2（1 次提交 + 1 个 tick）
+
+		var start sync.WaitGroup
+		start.Add(1)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var transferOK, advanceOK int32
+		go func() {
+			defer wg.Done()
+			start.Wait()
+			if _, err := s.Transfer("a", "b", 2, baseRev); err == nil {
+				atomic.StoreInt32(&transferOK, 1)
+			} else if !errors.Is(err, tenantsched.ErrConflict) {
+				t.Errorf("transfer unexpected error: %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			start.Wait()
+			if _, err := s.Advance(1, baseRev); err == nil {
+				atomic.StoreInt32(&advanceOK, 1)
+			} else if !errors.Is(err, tenantsched.ErrConflict) {
+				t.Errorf("advance unexpected error: %v", err)
+			}
+		}()
+		start.Done()
+		wg.Wait()
+
+		if transferOK+advanceOK != 1 {
+			t.Fatalf("round %d: transferOK=%d advanceOK=%d, want exactly one winner",
+				round, transferOK, advanceOK)
+		}
+		if s.Revision() != baseRev+1 {
+			t.Fatalf("round %d: revision=%d, want %d", round, s.Revision(), baseRev+1)
+		}
+		// 补推进到稳定状态后重放审计：无论谁先赢，账目都必须自洽。
+		for s.Now() < 5 {
+			if _, err := s.Advance(1, s.Revision()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		auditTransferReplay(t, s, []tenantsched.GroupSpec{
+			{ID: "R", Parent: "", Quota: 100},
+			{ID: "a", Parent: "R", Quota: 10},
+			{ID: "b", Parent: "R", Quota: 1},
+			{ID: "c", Parent: "b", Quota: 10},
+		})
+	}
+}
+
+// auditTransferReplay 把含转让的轨迹当事件流独立重放：维护每组的本周期
+// 转让净额，按“基础额度+净额”为有效额度核对扣减与阻挡，并校验周期归零、
+// 修订号 = 变更数（含转让）+ tick 数、每 tick 连续。
+func auditTransferReplay(t *testing.T, s *tenantsched.Scheduler, groups []tenantsched.GroupSpec) {
+	t.Helper()
+	trace := s.Trace()
+	snap := s.Snapshot()
+
+	base := map[string]int{}
+	parent := map[string]string{}
+	for _, g := range groups {
+		base[g.ID] = g.Quota
+		parent[g.ID] = g.Parent
+	}
+	used := map[string]int{}
+	adjust := map[string]int{}
+
+	var ticks, changes uint64
+	transferSeen := map[string]bool{}
+	for _, e := range trace {
+		ticks++
+		if e.Tick%tenantsched.PeriodTicks == 0 {
+			for k := range used {
+				used[k] = 0
+			}
+			for k := range adjust {
+				adjust[k] = 0
+			}
+		}
+		for _, a := range e.Applied {
+			changes++
+			if a.Revision == 0 {
+				t.Fatalf("tick %d applied change with zero revision", e.Tick)
+			}
+			if a.Kind == tenantsched.ChangeTransfer {
+				if a.Amount <= 0 || a.From == "" || parent[a.From] != parent[a.Group] {
+					t.Fatalf("tick %d malformed transfer: %+v", e.Tick, a)
+				}
+				key := fmt.Sprintf("%s:%s:%d", a.From, a.Group, a.Revision)
+				if transferSeen[key] {
+					t.Fatalf("transfer %s recorded twice", key)
+				}
+				transferSeen[key] = true
+				adjust[a.From] -= a.Amount
+				adjust[a.Group] += a.Amount
+				// 转让只动兄弟两组：投影式校验父组净额始终为 0。
+				if p := parent[a.From]; p != "" {
+					if adjust[p] != 0 {
+						t.Fatalf("transfer affected ancestor %s adjust=%d", p, adjust[p])
+					}
+				}
+			}
+		}
+		if e.Kind == tenantsched.TickRan {
+			for _, gid := range e.Path {
+				used[gid]++
+				eff := base[gid] + adjust[gid]
+				if used[gid] > eff {
+					t.Fatalf("tick %d group %s used %d exceeds effective %d (base=%d adjust=%d)",
+						e.Tick, gid, used[gid], eff, base[gid], adjust[gid])
+				}
+			}
+		}
+		if e.Kind == tenantsched.TickIdleBlocked {
+			eff := base[e.BlockedBy] + adjust[e.BlockedBy]
+			if used[e.BlockedBy] < eff {
+				t.Fatalf("tick %d blocker %s not exhausted: used=%d effective=%d",
+					e.Tick, e.BlockedBy, used[e.BlockedBy], eff)
+			}
+		}
+	}
+
+	if snap.Revision != changes+ticks {
+		t.Fatalf("revision=%d want changes(%d)+ticks(%d)", snap.Revision, changes, ticks)
+	}
+	// 快照有效额度必须与重放的净额一致。
+	for _, q := range snap.Quotas {
+		if q.Effective != base[q.GroupID]+adjust[q.GroupID] {
+			t.Fatalf("snapshot %s effective=%d replay(base=%d adjust=%d)=%d",
+				q.GroupID, q.Effective, base[q.GroupID], adjust[q.GroupID],
+				base[q.GroupID]+adjust[q.GroupID])
+		}
+		if q.Used != used[q.GroupID] {
+			t.Fatalf("snapshot %s used=%d replay=%d", q.GroupID, q.Used, used[q.GroupID])
+		}
+	}
+}
+
 // ---------- 轨迹审计：把产品轨迹当成事件流独立重放 ----------
 
 // auditNoDuplicateTicks 校验轨迹恰好覆盖 [from,to]，每个 tick 一条。
@@ -597,8 +839,8 @@ func auditReplay(t *testing.T, s *tenantsched.Scheduler, groups []tenantsched.Gr
 		if q.Used != used[q.GroupID] {
 			t.Fatalf("quota %s snapshot used=%d replay=%d", q.GroupID, q.Used, used[q.GroupID])
 		}
-		if q.Used > q.Quota {
-			t.Fatalf("quota %s over limit: %d/%d", q.GroupID, q.Used, q.Quota)
+		if q.Used > q.Effective {
+			t.Fatalf("quota %s over limit: %d/%d (base %d)", q.GroupID, q.Used, q.Effective, q.Quota)
 		}
 	}
 

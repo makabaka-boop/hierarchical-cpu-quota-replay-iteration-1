@@ -18,6 +18,7 @@ const (
 	opSubmit opKind = iota
 	opMigrate
 	opCancel
+	opTransfer
 	opAdvance
 )
 
@@ -28,6 +29,11 @@ type scriptOp struct {
 	target string              // migrate
 	jobID  string              // migrate/cancel
 	ticks  int                 // advance
+
+	// transfer：donor -> receiver 转 amount
+	donor    string
+	receiver string
+	amount   int
 
 	// wantErrIs 非 nil 时预期操作失败并匹配该哨兵错误。
 	wantErrIs error
@@ -48,7 +54,10 @@ func normalizeTrace(in []tenantsched.TraceEntry) []tenantsched.TraceEntry {
 		if len(e.Applied) > 0 {
 			cp.Applied = make([]tenantsched.AppliedChange, len(e.Applied))
 			for k, a := range e.Applied {
-				cp.Applied[k] = tenantsched.AppliedChange{Kind: a.Kind, JobID: a.JobID, Group: a.Group}
+				cp.Applied[k] = tenantsched.AppliedChange{
+					Kind: a.Kind, JobID: a.JobID, Group: a.Group,
+					From: a.From, Amount: a.Amount,
+				}
 			}
 		}
 		out[i] = cp
@@ -120,6 +129,16 @@ func runScenario(t *testing.T, sc scenario) {
 			if perr == nil {
 				if pr.Revision != rr {
 					t.Fatalf("op %d cancel revision mismatch product=%d ref=%d", idx, pr.Revision, rr)
+				}
+				commitRevs = append(commitRevs, pr.Revision)
+			}
+		case opTransfer:
+			pr, perr := prod.Transfer(op.donor, op.receiver, op.amount, prod.Revision())
+			rr, rerr := ref.transfer(op.donor, op.receiver, op.amount, ref.revision)
+			checkOp(t, idx, "transfer", perr, rerr, op.wantErrIs)
+			if perr == nil {
+				if pr.Revision != rr {
+					t.Fatalf("op %d transfer revision mismatch product=%d ref=%d", idx, pr.Revision, rr)
 				}
 				commitRevs = append(commitRevs, pr.Revision)
 			}
@@ -221,10 +240,12 @@ func compareSnapshots(t *testing.T, snap tenantsched.Snapshot, ref *refModel) {
 	}
 
 	var refQuotas []tenantsched.QuotaView
+	proj := ref.projected()
 	for _, g := range ref.groups {
+		p := proj[g.id]
 		refQuotas = append(refQuotas, tenantsched.QuotaView{
 			GroupID: g.id, Period: ref.now / tenantsched.PeriodTicks,
-			Quota: g.quota, Used: g.used,
+			Quota: g.quota, Effective: p.effective, Used: p.used,
 		})
 	}
 	sort.Slice(refQuotas, func(i, j int) bool { return refQuotas[i].GroupID < refQuotas[j].GroupID })
@@ -301,6 +322,103 @@ func scenarioIdleAndCancel() scenario {
 	}
 }
 
+// ---------- 场景 E：同父兄弟转让、祖先按有效额度阻挡与超期重放 ----------
+
+func scenarioSiblingTransfer() scenario {
+	return scenario{
+		name: "sibling_transfer_effective_quota",
+		groups: []tenantsched.GroupSpec{
+			{ID: "R", Parent: "", Quota: 3},
+			{ID: "a", Parent: "R", Quota: 4}, // 捐出组：本周期无作业
+			{ID: "b", Parent: "R", Quota: 1}, // 受让组
+			{ID: "c", Parent: "b", Quota: 10},
+		},
+		script: []scriptOp{
+			{kind: opSubmit, job: tenantsched.JobSpec{ID: "jb", ReleaseAt: 0, Work: 4, Deadline: 9, Group: "c"}},
+
+			{kind: opAdvance, ticks: 2}, // tick0 jb 跑一次；tick1 b 基础额度耗尽挡住
+			// 超过捐出组未用额度（4）的转让必须被拒，且两侧都不入账。
+			{kind: opTransfer, donor: "a", receiver: "b", amount: 5, wantErrIs: tenantsched.ErrInvalidArgument},
+			{kind: opTransfer, donor: "a", receiver: "b", amount: 3}, // b 有效额度 1->4
+
+			{kind: opAdvance, ticks: 1}, // tick2：入账 TRANSFER，jb 可跑
+			{kind: opAdvance, ticks: 1}, // tick3：再跑一次，祖先 R 用量到 3 耗尽
+			{kind: opAdvance, ticks: 1}, // tick4：b 仍有余，但最深阻挡祖先变为 R
+			{kind: opAdvance, ticks: 5}, // tick5..9 持续被 R 挡；tick9 jb 超期（欠 1）
+			{kind: opAdvance, ticks: 1}, // tick10：周期重置、净额归零，jb 跑完最后 1 并完成
+			{kind: opAdvance, ticks: 1}, // tick11：无就绪作业，IDLE_NOT_READY；转让已失效
+		},
+	}
+}
+
+// ---------- 场景 F：转让跨周期失效、边界临界提交按新周期判定 ----------
+
+func scenarioTransferAcrossPeriods() scenario {
+	return scenario{
+		name: "transfer_expires_at_period_boundary",
+		groups: []tenantsched.GroupSpec{
+			{ID: "R", Parent: "", Quota: 100},
+			{ID: "a", Parent: "R", Quota: 2}, // 捐出组：周期 0 内额度被自己作业用满
+			{ID: "b", Parent: "R", Quota: 5}, // 受让组
+		},
+		script: []scriptOp{
+			{kind: opSubmit, job: tenantsched.JobSpec{ID: "jd", ReleaseAt: 0, Work: 2, Deadline: 5, Group: "a"}},
+			{kind: opSubmit, job: tenantsched.JobSpec{ID: "jr", ReleaseAt: 0, Work: 8, Deadline: 19, Group: "b"}},
+
+			{kind: opAdvance, ticks: 2}, // tick0/1 jd 跑完，a 已用 2（不退还）
+			{kind: opAdvance, ticks: 5}, // tick2..6 jr 跑 5 次，b 基础额度耗尽
+			{kind: opAdvance, ticks: 2}, // tick7/8 jr 被 b 挡住
+
+			// now==9：a 本周期未用额度为 0，任何正转让都必须被拒
+			// （已执行 tick 的扣减不因转让退还）。
+			{kind: opTransfer, donor: "a", receiver: "b", amount: 1, wantErrIs: tenantsched.ErrInvalidArgument},
+			{kind: opAdvance, ticks: 1}, // tick9：继续被 b 挡住
+
+			// now==10，边界 tick 尚未执行：投影先归零，临界提交必须按
+			// 新周期满额判定，而不是上周期的零余额。
+			{kind: opTransfer, donor: "a", receiver: "b", amount: 2},
+			{kind: opAdvance, ticks: 1}, // tick10：重置后入账转让，jr 恢复执行
+			{kind: opAdvance, ticks: 2}, // tick11/12：jr 跑完欠的 2 个工作量并完成
+			{kind: opAdvance, ticks: 7}, // tick13..19 空转
+
+			// now==20：第二个新周期，上一周期的转让净额早已消失，
+			// a 的基础额度恢复后可以再次转出。
+			{kind: opTransfer, donor: "a", receiver: "b", amount: 1},
+			{kind: opAdvance, ticks: 1}, // tick20：重置后入账新转让，无作业空转
+		},
+	}
+}
+
+// ---------- 场景 G：迁组与转让交织，旧路径扣减不退还 ----------
+
+func scenarioMigrateAndTransfer() scenario {
+	return scenario{
+		name: "migrate_and_transfer_interleave",
+		groups: []tenantsched.GroupSpec{
+			{ID: "R", Parent: "", Quota: 100},
+			{ID: "a", Parent: "R", Quota: 3}, // 捐出组：jm 迁走前在此用掉 2
+			{ID: "b", Parent: "R", Quota: 1}, // 受让组
+			{ID: "x", Parent: "b", Quota: 10},
+		},
+		script: []scriptOp{
+			{kind: opSubmit, job: tenantsched.JobSpec{ID: "jm", ReleaseAt: 0, Work: 5, Deadline: 25, Group: "a"}},
+
+			{kind: opAdvance, ticks: 2}, // tick0/1 jm 在 a 路径跑，a 已用 2
+			{kind: opMigrate, jobID: "jm", target: "x"},
+			{kind: opAdvance, ticks: 1}, // tick2：入账 MIGRATE，jm 在 x>b>R 跑，b 已用 1
+			{kind: opAdvance, ticks: 1}, // tick3：b 耗尽挡住 jm
+			// a 未用额度只剩 1（旧扣减不退还）：只能转出 1。
+			{kind: opTransfer, donor: "a", receiver: "b", amount: 2, wantErrIs: tenantsched.ErrInvalidArgument},
+			{kind: opTransfer, donor: "a", receiver: "b", amount: 1},
+			{kind: opAdvance, ticks: 1}, // tick4：入账 TRANSFER，jm 再跑一次
+			{kind: opAdvance, ticks: 1}, // tick5：b 有效额度再次耗尽
+			{kind: opAdvance, ticks: 4}, // tick6..9：持续被 b 挡住
+			{kind: opAdvance, ticks: 1}, // tick10：重置+净额归零，jm 跑完最后 1
+			{kind: opAdvance, ticks: 9}, // tick11..19 空转
+		},
+	}
+}
+
 // ---------- 场景 D：同 tick 提交即参与调度 + 批量推进中的超期 ----------
 
 func scenarioSubmitAtTickAndDeadline() scenario {
@@ -368,6 +486,9 @@ func TestScenariosAgainstReference(t *testing.T) {
 		scenarioMigrateNoRefund(),
 		scenarioIdleAndCancel(),
 		scenarioSubmitAtTickAndDeadline(),
+		scenarioSiblingTransfer(),
+		scenarioTransferAcrossPeriods(),
+		scenarioMigrateAndTransfer(),
 	} {
 		t.Run(sc.name, func(t *testing.T) { runScenario(t, sc) })
 	}

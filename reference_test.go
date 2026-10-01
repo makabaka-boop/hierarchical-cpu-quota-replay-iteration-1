@@ -18,8 +18,9 @@ import (
 type refGroup struct {
 	id     string
 	parent string
-	quota  int
+	quota  int // 基础额度
 	used   int
+	adjust int // 本周期兄弟组转让净额：有效额度 = quota + adjust
 }
 
 type refJob struct {
@@ -37,6 +38,10 @@ type refPending struct {
 	kind  tenantsched.ChangeKind
 	jobID string
 	group string
+
+	// 仅 TRANSFER：from 捐出组、amount 转让量（group 复用为受让组）。
+	from   string
+	amount int
 }
 
 type refModel struct {
@@ -116,10 +121,12 @@ func (m *refModel) pathOf(gid string) []string {
 	return out
 }
 
+func (m *refModel) effective(g *refGroup) int { return g.quota + g.adjust }
+
 func (m *refModel) canRun(path []string) bool {
 	for _, gid := range path {
 		g := m.groups[gid]
-		if g.used >= g.quota {
+		if g.used >= m.effective(g) {
 			return false
 		}
 	}
@@ -129,11 +136,37 @@ func (m *refModel) canRun(path []string) bool {
 func (m *refModel) blocker(path []string) string {
 	for _, gid := range path {
 		g := m.groups[gid]
-		if g.used >= g.quota {
+		if g.used >= m.effective(g) {
 			return gid
 		}
 	}
 	return ""
+}
+
+// projected 独立重写“下一 tick 入账后”的周期投影：边界 tick 前先归零
+// 基础状态，再叠加待入账转让；其余 tick 在当前周期上叠加待入账转让。
+func (m *refModel) projected() map[string]struct{ effective, used int } {
+	out := map[string]struct{ effective, used int }{}
+	boundary := m.now%tenantsched.PeriodTicks == 0
+	for id, g := range m.groups {
+		adjust, used := g.adjust, g.used
+		if boundary {
+			adjust, used = 0, 0
+		}
+		out[id] = struct{ effective, used int }{g.quota + adjust, used}
+	}
+	for _, c := range m.queue {
+		if c.kind != tenantsched.ChangeTransfer {
+			continue
+		}
+		d := out[c.from]
+		d.effective -= c.amount
+		out[c.from] = d
+		r := out[c.group]
+		r.effective += c.amount
+		out[c.group] = r
+	}
+	return out
 }
 
 func (m *refModel) readyAt(t uint64) []string {
@@ -212,6 +245,37 @@ func (m *refModel) cancel(jobID string, expected uint64) (uint64, error) {
 	return m.revision, nil
 }
 
+// refTransfer 独立按自然语言规格实现兄弟组配额转让。
+func (m *refModel) transfer(donor, receiver string, amount int, expected uint64) (uint64, error) {
+	dg := m.groups[donor]
+	rg := m.groups[receiver]
+	if dg == nil {
+		return 0, tenantsched.ErrNotFound
+	}
+	if rg == nil {
+		return 0, tenantsched.ErrNotFound
+	}
+	if donor == receiver || dg.parent == "" || rg.parent == "" || dg.parent != rg.parent {
+		return 0, fmt.Errorf("not siblings")
+	}
+	if amount <= 0 {
+		return 0, fmt.Errorf("bad amount")
+	}
+	if m.revision != expected {
+		return 0, tenantsched.ErrConflict
+	}
+	proj := m.projected()
+	p := proj[donor]
+	if amount > p.effective-p.used {
+		return 0, fmt.Errorf("exceeds unused")
+	}
+	m.revision++
+	m.queue = append(m.queue, refPending{
+		kind: tenantsched.ChangeTransfer, from: donor, group: receiver, amount: amount,
+	})
+	return m.revision, nil
+}
+
 // refStep 是参考实现的单 tick 决策：重置 -> 入账变更 -> 选择执行 -> 超期。
 func (m *refModel) refStep(t uint64) (tenantsched.TraceEntry, []tenantsched.OverdueEvidence) {
 	e := tenantsched.TraceEntry{Tick: t, Period: t / tenantsched.PeriodTicks}
@@ -219,15 +283,21 @@ func (m *refModel) refStep(t uint64) (tenantsched.TraceEntry, []tenantsched.Over
 	if t%tenantsched.PeriodTicks == 0 {
 		for _, g := range m.groups {
 			g.used = 0
+			g.adjust = 0
 		}
 	}
 
 	if len(m.queue) > 0 {
 		e.Applied = make([]tenantsched.AppliedChange, 0, len(m.queue))
 		for _, c := range m.queue {
+			if c.kind == tenantsched.ChangeTransfer {
+				m.groups[c.from].adjust -= c.amount
+				m.groups[c.group].adjust += c.amount
+			}
 			// 参考实现不依赖修订号字段，统一填 0；比对前会归一化。
 			e.Applied = append(e.Applied, tenantsched.AppliedChange{
 				Kind: c.kind, JobID: c.jobID, Group: c.group,
+				From: c.from, Amount: c.amount,
 			})
 		}
 		m.queue = m.queue[:0]
