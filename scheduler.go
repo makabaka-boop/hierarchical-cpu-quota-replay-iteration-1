@@ -5,9 +5,9 @@
 // tick 至多执行一个作业一个单位的工作量，并同时沿作业所在组到根的
 // 路径扣减所有祖先组的配额。
 //
-// 所有写接口（提交、迁组、取消、推进时间）都携带期望修订号，构成乐观
-// 并发控制：修订号不匹配则拒绝且不产生任何副作用。修订号在每次成功的
-// 已提交变更以及每个已执行 tick 之后单调递增。
+// 所有写接口（提交、迁组、取消、同父兄弟组配额转让、推进时间）都携带
+// 期望修订号，构成乐观并发控制：修订号不匹配则拒绝且不产生任何副作用。
+// 修订号在每次成功的已提交变更以及每个已执行 tick 之后单调递增。
 package tenantsched
 
 import (
@@ -71,9 +71,10 @@ const (
 type ChangeKind string
 
 const (
-	ChangeSubmit  ChangeKind = "SUBMIT"
-	ChangeMigrate ChangeKind = "MIGRATE"
-	ChangeCancel  ChangeKind = "CANCEL"
+	ChangeSubmit   ChangeKind = "SUBMIT"
+	ChangeMigrate  ChangeKind = "MIGRATE"
+	ChangeCancel   ChangeKind = "CANCEL"
+	ChangeTransfer ChangeKind = "TRANSFER"
 )
 
 // GroupSpec 描述组树的一个节点。根的 Parent 必须为空字符串。
@@ -99,8 +100,13 @@ type AppliedChange struct {
 	Kind     ChangeKind
 	JobID    string
 	Revision uint64 // 该变更提交成功时的修订号
-	// Group：SUBMIT 时为提交组，MIGRATE 时为目标组，CANCEL 时为空。
+	// Group：SUBMIT 时为提交组，MIGRATE 时为目标组，TRANSFER 时为受让组，
+	// CANCEL 时为空。
 	Group string
+	// FromGroup 仅用于 TRANSFER：配额捐出组；其他变更为空。
+	FromGroup string
+	// Amount 仅用于 TRANSFER：本周期临时转让的配额数（正数）。
+	Amount int
 }
 
 // TraceEntry 是一个 tick 的完整轨迹。
@@ -148,8 +154,13 @@ type OverdueEvidence struct {
 type QuotaView struct {
 	GroupID string
 	Period  uint64 // 当前周期序号
-	Quota   int
-	Used    int
+	// Quota 是基础（每周期配置的）配额，转让不会改变它。
+	Quota int
+	// EffectiveQuota 是本周期的有效额度：基础配额加上同父兄弟组间
+	// 临时转让在本周期的净结果。周期边界恢复为基础配额。
+	EffectiveQuota int
+	// Used 是本周期已执行 tick 的扣减量；转让不退还已执行 tick 的扣减。
+	Used int
 }
 
 // JobView 是作业的只读快照。
@@ -192,6 +203,10 @@ type AdvanceResult struct {
 type groupNode struct {
 	spec GroupSpec
 	used int // 当前周期已用配额
+	// period 是 used/transferDelta 对应的周期序号；落后于 now/PeriodTicks
+	// 时必须先调用 rolloverLocked 结算到当前周期。
+	period        uint64
+	transferDelta int // 当前周期同父兄弟组配额转让的净结果（可负）
 }
 
 // jobState 是作业的内部可变状态。
@@ -209,6 +224,11 @@ type committedChange struct {
 	jobID    string
 	group    string
 	revision uint64
+
+	// 仅 TRANSFER 使用：fromGroup 为捐出组（group 字段复用为受让组），
+	// amount 为转让数量。
+	fromGroup string
+	amount    int
 }
 
 // Scheduler 是并发安全的单 CPU 租户调度模拟器。
@@ -265,7 +285,7 @@ func New(groups []GroupSpec) (*Scheduler, error) {
 			roots++
 			rootID = g.ID
 		}
-		nodes[g.ID] = &groupNode{spec: g}
+		nodes[g.ID] = &groupNode{spec: g, period: 0}
 	}
 	if roots != 1 {
 		return nil, fmt.Errorf("%w: group tree must have exactly one root, got %d", ErrInvalidArgument, roots)
@@ -339,11 +359,31 @@ func (s *Scheduler) ancestorPath(gid string) []string {
 	return path
 }
 
+// effectiveQuota 返回组当前周期的有效额度（基础配额加本周期转让净值）。
+func (s *Scheduler) effectiveQuota(g *groupNode) int {
+	return g.spec.Quota + g.transferDelta
+}
+
+// rolloverLocked 把所有组的周期账目结算到 cur 所在周期：跨周期时本周期
+// 已用量先归零，兄弟组临时转让全部失效，有效额度恢复为基础配额。
+// 同一周期内重复调用无效果。
+func (s *Scheduler) rolloverLocked(cur uint64) {
+	target := cur / PeriodTicks
+	for _, g := range s.groups {
+		if g.period == target {
+			continue
+		}
+		g.used = 0
+		g.transferDelta = 0
+		g.period = target
+	}
+}
+
 // feasible 判断沿 path 的所有祖先在当前周期是否仍有配额。
 func (s *Scheduler) feasible(path []string) bool {
 	for _, gid := range path {
 		g := s.groups[gid]
-		if g.used >= g.spec.Quota {
+		if g.used >= s.effectiveQuota(g) {
 			return false
 		}
 	}
@@ -351,11 +391,11 @@ func (s *Scheduler) feasible(path []string) bool {
 }
 
 // nearestExhausted 返回 path 上最深（离作业所在组最近）的配额耗尽祖先；
-// 没有则返回空串。
+// 没有则返回空串。是否耗尽按当时有效额度判定（含本周期兄弟组转让）。
 func (s *Scheduler) nearestExhausted(path []string) string {
 	for _, gid := range path {
 		g := s.groups[gid]
-		if g.used >= g.spec.Quota {
+		if g.used >= s.effectiveQuota(g) {
 			return gid
 		}
 	}
@@ -492,6 +532,77 @@ func (s *Scheduler) cancelLocked(jobID string, expectedRevision uint64) (CommitR
 	return CommitResult{Revision: rev, Now: s.now}, nil
 }
 
+// TransferQuota 在同一父组的两个兄弟组之间临时转让 amount 个本周期配额：
+// donor 捐出、recipient 受让。expectedRevision 必须等于当前修订号。
+//
+// 校验顺序：参数/存在性/同父兄弟关系/正数量先于修订号比较；修订号通过后
+// 先把周期账目结算到当前周期（临界提交不得读上一周期余额），再校验
+// amount 不超过 donor 当前周期未用额度（effectiveQuota - used）。
+//
+// 转让只改变 donor 与 recipient 两组本周期的有效额度：不增加父组或任何
+// 祖先的额度，不退还已执行 tick 的扣减，也不改变任何组的基础配额。
+// 转让立即生效并在下一个 tick 开头作为 TRANSFER 变更进入 Applied 轨迹；
+// 到周期边界两组先归零并恢复基础额度，本转让随之失效。
+func (s *Scheduler) TransferQuota(donor, recipient string, amount int, expectedRevision uint64) (CommitResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.transferQuotaLocked(donor, recipient, amount, expectedRevision)
+}
+
+func (s *Scheduler) transferQuotaLocked(donor, recipient string, amount int, expectedRevision uint64) (CommitResult, error) {
+	dg, ok := s.groups[donor]
+	if !ok {
+		return CommitResult{}, fmt.Errorf("%w: unknown donor group %q", ErrNotFound, donor)
+	}
+	rg, ok := s.groups[recipient]
+	if !ok {
+		return CommitResult{}, fmt.Errorf("%w: unknown recipient group %q", ErrNotFound, recipient)
+	}
+	if donor == recipient {
+		return CommitResult{}, fmt.Errorf("%w: donor and recipient must differ, got %q", ErrInvalidArgument, donor)
+	}
+	if dg.spec.Parent != rg.spec.Parent {
+		return CommitResult{}, fmt.Errorf("%w: groups %q and %q are not siblings (parents %q vs %q)",
+			ErrInvalidArgument, donor, recipient, dg.spec.Parent, rg.spec.Parent)
+	}
+	if amount <= 0 {
+		return CommitResult{}, fmt.Errorf("%w: transfer amount must be positive, got %d", ErrInvalidArgument, amount)
+	}
+	if s.revision != expectedRevision {
+		return CommitResult{}, fmt.Errorf("%w: expected %d, current %d", ErrConflict, expectedRevision, s.revision)
+	}
+
+	// 只读地按当前周期计算 donor 未用额度：若 donor 的周期账目尚未结算到
+	// now 所在周期（临界提交落在周期边界、本周期还没有任何 tick），则按
+	// 新周期的基础额度与零已用量判定，绝不能读到上一周期余额。失败路径
+	// 不允许改动任何账目，因此这里不能调用 rolloverLocked。
+	curPeriod := s.now / PeriodTicks
+	donorUsed, donorEff := 0, dg.spec.Quota
+	if dg.period == curPeriod {
+		donorUsed, donorEff = dg.used, s.effectiveQuota(dg)
+	}
+	if unused := donorEff - donorUsed; amount > unused {
+		return CommitResult{}, fmt.Errorf("%w: transfer %d exceeds unused quota %d of donor %q",
+			ErrInvalidArgument, amount, unused, donor)
+	}
+
+	// 提交成功才正式结算周期账目（清零已用量、失效上周期转让）。
+	s.rolloverLocked(s.now)
+
+	s.revision++
+	rev := s.revision
+	dg.transferDelta -= amount
+	rg.transferDelta += amount
+	s.pending = append(s.pending, committedChange{
+		kind:      ChangeTransfer,
+		group:     recipient,
+		revision:  rev,
+		fromGroup: donor,
+		amount:    amount,
+	})
+	return CommitResult{Revision: rev, Now: s.now}, nil
+}
+
 // Advance 推进时钟 ticks 个整数 tick。expectedRevision 必须等于当前修订号，
 // 否则整体拒绝、一个 tick 都不执行。
 //
@@ -536,12 +647,9 @@ func (s *Scheduler) stepLocked(tick uint64) (TraceEntry, []OverdueEvidence) {
 	period := tick / PeriodTicks
 	entry := TraceEntry{Tick: tick, Period: period}
 
-	// 1) 周期边界：周期首个 tick 清零所有组的已用配额。
-	if tick%PeriodTicks == 0 {
-		for _, g := range s.groups {
-			g.used = 0
-		}
-	}
+	// 1) 周期边界：进入新周期时所有组本周期已用配额清零，上一周期的
+	// 兄弟组临时转让全部失效，有效额度恢复为基础配额。
+	s.rolloverLocked(tick)
 
 	// 2) 处理自上一个 tick 以来已提交的变更（立即生效模型下仅需记录）。
 	if len(s.pending) > 0 {
@@ -549,6 +657,7 @@ func (s *Scheduler) stepLocked(tick uint64) (TraceEntry, []OverdueEvidence) {
 		for _, c := range s.pending {
 			entry.Applied = append(entry.Applied, AppliedChange{
 				Kind: c.kind, JobID: c.jobID, Revision: c.revision, Group: c.group,
+				FromGroup: c.fromGroup, Amount: c.amount,
 			})
 		}
 		s.pending = s.pending[:0]
@@ -656,9 +765,16 @@ func (s *Scheduler) Snapshot() Snapshot {
 	period := s.now / PeriodTicks
 	quotas := make([]QuotaView, 0, len(s.groups))
 	for _, g := range s.groups {
+		// 已结算到当前周期的组展示含转让的有效额度；period 落后的组尚未
+		// 进入新周期（调度器只在 tick 开头或临界提交时结算），其转让随上
+		// 周期结束失效，新周期有效额度即为基础额度。
+		effective := g.spec.Quota
+		if g.period == period {
+			effective = s.effectiveQuota(g)
+		}
 		quotas = append(quotas, QuotaView{
 			GroupID: g.spec.ID, Period: period,
-			Quota: g.spec.Quota, Used: g.used,
+			Quota: g.spec.Quota, EffectiveQuota: effective, Used: g.used,
 		})
 	}
 	sort.Slice(quotas, func(i, j int) bool { return quotas[i].GroupID < quotas[j].GroupID })
@@ -737,6 +853,8 @@ func RenderTrace(trace []TraceEntry) string {
 					parts = append(parts, fmt.Sprintf("SUBMIT[%s->%s]@r%d", c.JobID, c.Group, c.Revision))
 				case ChangeMigrate:
 					parts = append(parts, fmt.Sprintf("MIGRATE[%s->%s]@r%d", c.JobID, c.Group, c.Revision))
+				case ChangeTransfer:
+					parts = append(parts, fmt.Sprintf("TRANSFER[%s->%s x%d]@r%d", c.FromGroup, c.Group, c.Amount, c.Revision))
 				default:
 					parts = append(parts, fmt.Sprintf("CANCEL[%s]@r%d", c.JobID, c.Revision))
 				}

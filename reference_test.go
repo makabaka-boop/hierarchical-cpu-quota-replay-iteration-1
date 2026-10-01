@@ -20,6 +20,31 @@ type refGroup struct {
 	parent string
 	quota  int
 	used   int
+
+	// 与产品实现独立的周期账目：period 是 used/delta 所属周期序号，
+	// delta 是同父兄弟组临时转让在当前周期的净结果（可负）。
+	period uint64
+	delta  int
+}
+
+// eff 返回 g 在给定周期的有效额度；period 落后于 cur 时上一周期的转让
+// 已随周期边界失效，有效额度就是基础配额。
+func (g *refGroup) eff(cur uint64) int {
+	if g.period == cur/tenantsched.PeriodTicks {
+		return g.quota + g.delta
+	}
+	return g.quota
+}
+
+// rollover 把该组结算到 cur 所在周期：跨周期时已用量归零、转让失效。
+func (g *refGroup) rollover(cur uint64) {
+	p := cur / tenantsched.PeriodTicks
+	if g.period == p {
+		return
+	}
+	g.used = 0
+	g.delta = 0
+	g.period = p
 }
 
 type refJob struct {
@@ -37,6 +62,10 @@ type refPending struct {
 	kind  tenantsched.ChangeKind
 	jobID string
 	group string
+
+	// 仅 TRANSFER：fromGroup 为捐出组（group 复用为受让组），amount 为数量。
+	fromGroup string
+	amount    int
 }
 
 type refModel struct {
@@ -119,7 +148,7 @@ func (m *refModel) pathOf(gid string) []string {
 func (m *refModel) canRun(path []string) bool {
 	for _, gid := range path {
 		g := m.groups[gid]
-		if g.used >= g.quota {
+		if g.used >= g.eff(m.now) {
 			return false
 		}
 	}
@@ -129,7 +158,7 @@ func (m *refModel) canRun(path []string) bool {
 func (m *refModel) blocker(path []string) string {
 	for _, gid := range path {
 		g := m.groups[gid]
-		if g.used >= g.quota {
+		if g.used >= g.eff(m.now) {
 			return gid
 		}
 	}
@@ -212,13 +241,62 @@ func (m *refModel) cancel(jobID string, expected uint64) (uint64, error) {
 	return m.revision, nil
 }
 
+// transfer 在同一父组的两个兄弟组之间临时转让 amount 个当前周期配额。
+// 独立推导（不参照产品实现）：先做结构性校验，再比较修订号，最后只读地
+// 按当前周期判定 donor 未用额度；失败不动任何账目，成功时才结算周期、
+// 改两组的本周期净额度并入队。
+func (m *refModel) transfer(donor, recipient string, amount int, expected uint64) (uint64, error) {
+	dg := m.groups[donor]
+	rg := m.groups[recipient]
+	if dg == nil {
+		return 0, tenantsched.ErrNotFound
+	}
+	if rg == nil {
+		return 0, tenantsched.ErrNotFound
+	}
+	if donor == recipient {
+		return 0, fmt.Errorf("donor equals recipient")
+	}
+	if dg.parent != rg.parent {
+		return 0, fmt.Errorf("not siblings")
+	}
+	if amount <= 0 {
+		return 0, fmt.Errorf("non-positive amount")
+	}
+	if m.revision != expected {
+		return 0, tenantsched.ErrConflict
+	}
+
+	cur := m.now / tenantsched.PeriodTicks
+	donorUsed, donorEff := 0, dg.quota
+	if dg.period == cur {
+		donorUsed, donorEff = dg.used, dg.quota+dg.delta
+	}
+	if amount > donorEff-donorUsed {
+		return 0, fmt.Errorf("exceeds unused")
+	}
+
+	for _, g := range m.groups {
+		g.rollover(m.now)
+	}
+
+	m.revision++
+	dg.delta -= amount
+	rg.delta += amount
+	m.queue = append(m.queue, refPending{
+		kind: tenantsched.ChangeTransfer, group: recipient,
+		fromGroup: donor, amount: amount,
+	})
+	return m.revision, nil
+}
+
 // refStep 是参考实现的单 tick 决策：重置 -> 入账变更 -> 选择执行 -> 超期。
 func (m *refModel) refStep(t uint64) (tenantsched.TraceEntry, []tenantsched.OverdueEvidence) {
 	e := tenantsched.TraceEntry{Tick: t, Period: t / tenantsched.PeriodTicks}
 
 	if t%tenantsched.PeriodTicks == 0 {
 		for _, g := range m.groups {
-			g.used = 0
+			g.rollover(t)
 		}
 	}
 
@@ -228,6 +306,7 @@ func (m *refModel) refStep(t uint64) (tenantsched.TraceEntry, []tenantsched.Over
 			// 参考实现不依赖修订号字段，统一填 0；比对前会归一化。
 			e.Applied = append(e.Applied, tenantsched.AppliedChange{
 				Kind: c.kind, JobID: c.jobID, Group: c.group,
+				FromGroup: c.fromGroup, Amount: c.amount,
 			})
 		}
 		m.queue = m.queue[:0]

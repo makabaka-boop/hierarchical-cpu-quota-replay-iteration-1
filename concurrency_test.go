@@ -512,7 +512,14 @@ func auditReplay(t *testing.T, s *tenantsched.Scheduler, groups []tenantsched.Gr
 	for _, g := range groups {
 		quota[g.ID] = g.Quota
 	}
+	parent := map[string]string{}
+	for _, g := range groups {
+		parent[g.ID] = g.Parent
+	}
 	used := map[string]int{}
+	// delta 是当前周期各组兄弟转让的净额度，随周期边界清零；
+	// effective = base + delta，阻挡与超期重放都必须按 effective 判定。
+	delta := map[string]int{}
 	ranCount := map[string]int{}
 
 	var totalTicks uint64
@@ -525,6 +532,9 @@ func auditReplay(t *testing.T, s *tenantsched.Scheduler, groups []tenantsched.Gr
 			for k := range used {
 				used[k] = 0
 			}
+			for k := range delta {
+				delta[k] = 0
+			}
 		}
 		for _, a := range e.Applied {
 			commitCount++
@@ -534,11 +544,27 @@ func auditReplay(t *testing.T, s *tenantsched.Scheduler, groups []tenantsched.Gr
 			if a.Kind == tenantsched.ChangeMigrate && a.Group == "" {
 				t.Fatalf("tick %d migrate without target group", e.Tick)
 			}
-			key := fmt.Sprintf("%s:%s:%d", a.Kind, a.JobID, a.Revision)
+			key := fmt.Sprintf("%s:%s:%s:%d", a.Kind, a.JobID, a.Group, a.Revision)
 			if appliedSeen[key] {
 				t.Fatalf("change %s recorded in two ticks", key)
 			}
 			appliedSeen[key] = true
+			if a.Kind == tenantsched.ChangeTransfer {
+				if a.Amount <= 0 || a.FromGroup == "" || a.FromGroup == a.Group {
+					t.Fatalf("tick %d malformed transfer: %+v", e.Tick, a)
+				}
+				if parent[a.FromGroup] != parent[a.Group] {
+					t.Fatalf("tick %d transfer %s->%s between non-siblings", e.Tick, a.FromGroup, a.Group)
+				}
+				// 入账时刻（tick 开头）捐出组必须仍有足够未用有效额度。
+				donorEff := quota[a.FromGroup] + delta[a.FromGroup]
+				if a.Amount > donorEff-used[a.FromGroup] {
+					t.Fatalf("tick %d transfer %d exceeds donor %s unused (eff=%d used=%d)",
+						e.Tick, a.Amount, a.FromGroup, donorEff, used[a.FromGroup])
+				}
+				delta[a.FromGroup] -= a.Amount
+				delta[a.Group] += a.Amount
+			}
 		}
 
 		switch e.Kind {
@@ -555,8 +581,9 @@ func auditReplay(t *testing.T, s *tenantsched.Scheduler, groups []tenantsched.Gr
 					t.Fatalf("tick %d deducted[%d]=%d but replay used=%d for %s",
 						e.Tick, i, e.Deducted[i], used[gid], gid)
 				}
-				if used[gid] > quota[gid] {
-					t.Fatalf("tick %d group %s used %d > quota %d", e.Tick, gid, used[gid], quota[gid])
+				if used[gid] > quota[gid]+delta[gid] {
+					t.Fatalf("tick %d group %s used %d > effective quota %d (base %d)",
+						e.Tick, gid, used[gid], quota[gid]+delta[gid], quota[gid])
 				}
 			}
 			ranCount[e.JobID]++
@@ -564,9 +591,9 @@ func auditReplay(t *testing.T, s *tenantsched.Scheduler, groups []tenantsched.Gr
 			if e.Ran || e.JobID != "" || e.BlockedBy == "" || e.ReadyCount == 0 {
 				t.Fatalf("tick %d malformed IDLE_BLOCKED: %+v", e.Tick, e)
 			}
-			if used[e.BlockedBy] < quota[e.BlockedBy] {
-				t.Fatalf("tick %d blocker %s not exhausted: used=%d quota=%d",
-					e.Tick, e.BlockedBy, used[e.BlockedBy], quota[e.BlockedBy])
+			if used[e.BlockedBy] < quota[e.BlockedBy]+delta[e.BlockedBy] {
+				t.Fatalf("tick %d blocker %s not exhausted: used=%d effective=%d",
+					e.Tick, e.BlockedBy, used[e.BlockedBy], quota[e.BlockedBy]+delta[e.BlockedBy])
 			}
 		case tenantsched.TickIdleNotReady:
 			if e.Ran || e.JobID != "" || e.BlockedBy != "" || e.ReadyCount != 0 {
@@ -597,8 +624,12 @@ func auditReplay(t *testing.T, s *tenantsched.Scheduler, groups []tenantsched.Gr
 		if q.Used != used[q.GroupID] {
 			t.Fatalf("quota %s snapshot used=%d replay=%d", q.GroupID, q.Used, used[q.GroupID])
 		}
-		if q.Used > q.Quota {
-			t.Fatalf("quota %s over limit: %d/%d", q.GroupID, q.Used, q.Quota)
+		if q.Used > q.EffectiveQuota {
+			t.Fatalf("quota %s over effective limit: %d/%d", q.GroupID, q.Used, q.EffectiveQuota)
+		}
+		if q.EffectiveQuota != quota[q.GroupID]+delta[q.GroupID] {
+			t.Fatalf("quota %s effective=%d replay=%d+%d",
+				q.GroupID, q.EffectiveQuota, quota[q.GroupID], delta[q.GroupID])
 		}
 	}
 
